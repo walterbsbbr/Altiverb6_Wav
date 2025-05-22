@@ -1,0 +1,1 @@
+A command line Python script used to convert an old Altiverb 6 impulse CD on wav to use with generic impulse files app like Convology (freeware) . At this time  get to convert some files ok , and some not so OK. Anyone are free to try and improve
