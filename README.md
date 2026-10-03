@@ -1,1 +1,17 @@
-A command line Python script used to convert an old Altiverb 6 impulse CD on wav to use with generic impulse files app like Convology (freeware) . At this time  get to convert some files ok , and some not so OK. Anyone are free to try and improve
+# Altiverb6_Wav
+
+Lossless converter for an Altiverb 6 impulse-response library (IR Installer CDs) to plain WAV files
+for generic convolution apps such as Convology.
+
+Most Altiverb 6 channel files (`.1 .2 .3 .4 .L .R .C .Ls .Rs`) are not raw PCM but Audio Ease's own
+compressed format (`cir2` and two older variants): a fixed 3rd-order predictor with residuals packed
+in small blocks. `Alti.py` decodes them exactly (each file is checked against the encoder's rules),
+applies the per-channel gains and sample rates from `info.iri`, and writes 32-bit float WAVs in a
+mirrored folder tree. See the docstring at the top of `Alti.py` for the format details.
+
+    pip install numpy soundfile
+    python3 Alti.py -o "<output folder>"          # converts the IR Installer folders next to this repo
+    python3 Alti.py <items folder> -o "<output>"   # or any folder of Altiverb IRs
+
+Options: `--pcm24` (24-bit PCM output), `--raw` (no info.iri gains), `--peak <dBFS>` (level of the
+loudest channel per IR folder, default -0.1).
