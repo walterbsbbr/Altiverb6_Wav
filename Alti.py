@@ -30,8 +30,10 @@ Usage:
 
 Without arguments it converts the three "IR Installer */data/items" folders next to this script
 into "Altiverb 6 Library (decoded)" next to them. The folder tree is mirrored (with the leading
-'%' that Altiverb uses on folder names removed), each IR channel becomes <name>.wav, and pictures,
-movies and info.iri files are copied along.
+'%' that Altiverb uses on folder names removed) and each IR channel becomes <name>.wav. Pictures and
+movies go into a "00 DEFAULT PICTURES" folder the way Convology libraries are laid out (each
+picture as .jpg and .png, named "<first IR>_1", "_2"... inside an IR folder), and info.iri
+and .kmz files are copied along.
 
 Levels: Audio Ease normalised every channel file to full scale and stored the gain that restores
 it as the 4th field of its info.iri line ("name: 3 <rate> <samples> <gain dB> ..."). The converter
@@ -51,10 +53,13 @@ import sys
 
 import numpy as np
 import soundfile as sf
+from PIL import Image
 
 MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6)}
 CHANNEL_SUFFIX = re.compile(r"\.(\d|L|R|C|Ls|Rs|LFE|l|r|c|ls|rs)$")
-COPY_EXT = {".jpg", ".jpeg", ".png", ".gif", ".mov", ".kmz", ".iri"}
+COPY_EXT = {".kmz", ".iri"}
+PICTURE_EXT = {".jpg", ".jpeg", ".png", ".gif"}
+PICTURES_DIR = "00 DEFAULT PICTURES"
 
 
 class FormatError(Exception):
@@ -199,10 +204,6 @@ def convert_folder(root, files, dst, args, stats, log):
     for f in files:
         src = os.path.join(root, f)
         data = open(src, "rb").read()
-        if data[:3] == b"\xff\xd8\xff":
-            os.makedirs(dst, exist_ok=True)
-            shutil.copyfile(src, os.path.join(dst, f + ".jpg"))  # mislabelled picture
-            continue
         rate, count, gain = info.get(f.lower(), (None, None, None))
         try:
             if data[:4] == b"RIFF":
@@ -250,22 +251,60 @@ def convert_folder(root, files, dst, args, stats, log):
         print("converted %d ..." % (stats["decoded"] + stats["wav read"]), flush=True)
 
 
+def write_pictures(pictures, movies, dst, wav_names, stats, log):
+    """Convology layout: pictures (as .jpg and .png) and movies go in "00 DEFAULT PICTURES".
+    In an IR folder they are named after its first IR, "<ir>_1", "<ir>_2"...; elsewhere they keep
+    their own names."""
+    if not pictures and not movies:
+        return
+    out = os.path.join(dst, PICTURES_DIR)
+    os.makedirs(out, exist_ok=True)
+    for i, src in enumerate(pictures, 1):
+        name = "%s_%d" % (wav_names[0], i) if wav_names else os.path.splitext(os.path.basename(src))[0]
+        try:
+            with Image.open(src) as im:
+                if im.format == "JPEG":
+                    shutil.copyfile(src, os.path.join(out, name + ".jpg"))
+                else:
+                    im.convert("RGB").save(os.path.join(out, name + ".jpg"), quality=95)
+                if im.format == "PNG":
+                    shutil.copyfile(src, os.path.join(out, name + ".png"))
+                else:
+                    im.save(os.path.join(out, name + ".png"))
+            stats["pictures"] += 1
+        except OSError as e:
+            log.write("picture not readable, skipped: %s (%s)\n" % (src, e))
+    for src in movies:
+        shutil.copyfile(src, os.path.join(out, os.path.basename(src)))
+
+
 def convert_tree(src_root, out_root, args, stats, log):
     for root, dirs, files in os.walk(src_root):
         dirs.sort()
         rel = os.path.relpath(root, src_root)
         dst = out_root if rel == "." else os.path.join(out_root, *[clean(p) for p in rel.split(os.sep)])
-        ir_files = []
+        ir_files, pictures, movies = [], [], []
         for f in sorted(files):
             if f.startswith(".") or f.startswith("Icon"):
                 continue
+            src = os.path.join(root, f)
+            ext = os.path.splitext(f)[1].lower()
             if CHANNEL_SUFFIX.search(f):
+                with open(src, "rb") as fh:
+                    if fh.read(3) == b"\xff\xd8\xff":  # a few are mislabelled JPEGs
+                        pictures.append(src)
+                        continue
                 ir_files.append(f)
-            elif os.path.splitext(f)[1].lower() in COPY_EXT:
+            elif ext in PICTURE_EXT:
+                pictures.append(src)
+            elif ext == ".mov":
+                movies.append(src)
+            elif ext in COPY_EXT:
                 os.makedirs(dst, exist_ok=True)
-                shutil.copyfile(os.path.join(root, f), os.path.join(dst, f))
+                shutil.copyfile(src, os.path.join(dst, f))
         if ir_files:
             convert_folder(root, ir_files, dst, args, stats, log)
+        write_pictures(pictures, movies, dst, ir_files, stats, log)
 
 
 def main():
@@ -286,7 +325,7 @@ def main():
         if os.path.isdir(os.path.join(base, d, "data", "items"))
     ]
     os.makedirs(args.output, exist_ok=True)
-    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing")}
+    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures")}
     with open(os.path.join(args.output, "conversion log.txt"), "w") as log:
         for s in sources:
             print("Source:", s)
