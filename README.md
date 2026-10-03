@@ -16,3 +16,12 @@ mirrored folder tree. See the docstring at the top of `Alti.py` for the format d
 
 Options: `--pcm24` (24-bit PCM output), `--raw` (no info.iri gains), `--peak <dBFS>` (level of the
 loudest channel per IR folder, default -0.1).
+
+## Interface (PyQt5)
+
+    pip install PyQt5 numpy soundfile pillow
+    python3 AltiGUI.py            # or double-click AltiGUI.command
+
+Choose a source folder (Altiverb 6 IR folders and/or Altiverb 7 `.irbulk` files anywhere inside
+it) and an output folder, then Convert. Same conversion and options as `Alti.py`, with a progress
+bar, a Stop button and the log in the window.
