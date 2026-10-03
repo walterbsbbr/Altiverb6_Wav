@@ -31,9 +31,12 @@ Usage:
 Without arguments it converts the three "IR Installer */data/items" folders next to this script
 into "Altiverb 6 Library (decoded)" next to them. The folder tree is mirrored (with the leading
 '%' that Altiverb uses on folder names removed) and each IR channel becomes <name>.wav. Pictures and
-movies go into a "00 DEFAULT PICTURES" folder the way Convology libraries are laid out (each
-picture as .jpg and .png, named "<first IR>_1", "_2"... inside an IR folder), and info.iri
-and .kmz files are copied along.
+movies go into a "00 DEFAULT PICTURES" folder the way Convology libraries are laid out. Convology
+shows a picture whose name matches the start of the IR file name, so inside an IR folder pictures
+are named after the common start of its IR names ("Main Hall config b.jpg" serves all the
+"Main Hall config b.*.wav"), as .jpg and .png; IR folders without a picture borrow
+the venue's, or the closest-named sibling folder's.
+info.iri and .kmz files are copied along.
 
 Levels: Audio Ease normalised every channel file to full scale and stored the gain that restores
 it as the 4th field of its info.iri line ("name: 3 <rate> <samples> <gain dB> ..."). The converter
@@ -251,26 +254,38 @@ def convert_folder(root, files, dst, args, stats, log):
         print("converted %d ..." % (stats["decoded"] + stats["wav read"]), flush=True)
 
 
+def picture_names(wav_names):
+    """Convology shows a picture whose name matches the start of the IR name ("Room.png" serves
+    "Room Front.wav" and "Room Rear.wav"), so name pictures after the common start of all the IR
+    names in the folder. If they share none, every IR gets its own copy."""
+    prefix = os.path.commonprefix(wav_names).rstrip(" ._-")
+    return [prefix] if prefix else list(wav_names)
+
+
 def write_pictures(pictures, movies, dst, wav_names, stats, log):
-    """Convology layout: pictures (as .jpg and .png) and movies go in "00 DEFAULT PICTURES".
-    In an IR folder they are named after its first IR, "<ir>_1", "<ir>_2"...; elsewhere they keep
-    their own names."""
+    """Pictures go in "00 DEFAULT PICTURES" as .jpg and .png. In an IR folder the first one is named
+    after its IRs (see picture_names), further ones get "_2", "_3"...; elsewhere they keep their
+    own names. Movies go in the same folder."""
     if not pictures and not movies:
         return
     out = os.path.join(dst, PICTURES_DIR)
     os.makedirs(out, exist_ok=True)
     for i, src in enumerate(pictures, 1):
-        name = "%s_%d" % (wav_names[0], i) if wav_names else os.path.splitext(os.path.basename(src))[0]
+        if wav_names:
+            names = [n if i == 1 else "%s_%d" % (n, i) for n in picture_names(wav_names)]
+        else:
+            names = [os.path.splitext(os.path.basename(src))[0]]
         try:
             with Image.open(src) as im:
-                if im.format == "JPEG":
-                    shutil.copyfile(src, os.path.join(out, name + ".jpg"))
-                else:
-                    im.convert("RGB").save(os.path.join(out, name + ".jpg"), quality=95)
-                if im.format == "PNG":
-                    shutil.copyfile(src, os.path.join(out, name + ".png"))
-                else:
-                    im.save(os.path.join(out, name + ".png"))
+                for name in names:
+                    if im.format == "JPEG":
+                        shutil.copyfile(src, os.path.join(out, name + ".jpg"))
+                    else:
+                        im.convert("RGB").save(os.path.join(out, name + ".jpg"), quality=95)
+                    if im.format == "PNG":
+                        shutil.copyfile(src, os.path.join(out, name + ".png"))
+                    else:
+                        im.save(os.path.join(out, name + ".png"))
             stats["pictures"] += 1
         except OSError as e:
             log.write("picture not readable, skipped: %s (%s)\n" % (src, e))
@@ -278,25 +293,65 @@ def write_pictures(pictures, movies, dst, wav_names, stats, log):
         shutil.copyfile(src, os.path.join(out, os.path.basename(src)))
 
 
+def readable_pictures(paths):
+    good = []
+    for p in paths:
+        try:
+            with Image.open(p):
+                good.append(p)
+        except OSError:
+            pass
+    return good
+
+
+def own_pictures(folder, files):
+    pictures = []
+    for f in sorted(files):
+        if f.startswith("."):
+            continue
+        src = os.path.join(folder, f)
+        if os.path.splitext(f)[1].lower() in PICTURE_EXT:
+            pictures.append(src)
+        elif CHANNEL_SUFFIX.search(f):
+            with open(src, "rb") as fh:
+                if fh.read(3) == b"\xff\xd8\xff":  # a few channel files are mislabelled JPEGs
+                    pictures.append(src)
+    return readable_pictures(pictures)
+
+
+def borrowed_pictures(root, src_root, all_pictures):
+    """For an IR folder without a picture: the nearest parent folder's pictures, else those of the
+    sibling folder whose name is closest (e.g. "Room m-q" borrows from "Room m-m")."""
+    up = os.path.dirname(root)
+    while len(up) >= len(src_root):
+        if all_pictures.get(up):
+            return all_pictures[up]
+        up = os.path.dirname(up)
+    parent, name = os.path.split(root)
+    siblings = [d for d in all_pictures if os.path.dirname(d) == parent and all_pictures[d]]
+    if not siblings:
+        return []
+    best = max(sorted(siblings), key=lambda d: len(os.path.commonprefix([name, os.path.basename(d)])))
+    return all_pictures[best]
+
+
 def convert_tree(src_root, out_root, args, stats, log):
+    all_pictures = {root: own_pictures(root, files) for root, dirs, files in os.walk(src_root)}
     for root, dirs, files in os.walk(src_root):
         dirs.sort()
         rel = os.path.relpath(root, src_root)
         dst = out_root if rel == "." else os.path.join(out_root, *[clean(p) for p in rel.split(os.sep)])
-        ir_files, pictures, movies = [], [], []
+        ir_files, movies = [], []
+        pictures = all_pictures[root]
         for f in sorted(files):
             if f.startswith(".") or f.startswith("Icon"):
                 continue
             src = os.path.join(root, f)
             ext = os.path.splitext(f)[1].lower()
+            if src in pictures or ext in PICTURE_EXT:
+                continue
             if CHANNEL_SUFFIX.search(f):
-                with open(src, "rb") as fh:
-                    if fh.read(3) == b"\xff\xd8\xff":  # a few are mislabelled JPEGs
-                        pictures.append(src)
-                        continue
                 ir_files.append(f)
-            elif ext in PICTURE_EXT:
-                pictures.append(src)
             elif ext == ".mov":
                 movies.append(src)
             elif ext in COPY_EXT:
@@ -304,6 +359,10 @@ def convert_tree(src_root, out_root, args, stats, log):
                 shutil.copyfile(src, os.path.join(dst, f))
         if ir_files:
             convert_folder(root, ir_files, dst, args, stats, log)
+            if not pictures:
+                pictures = borrowed_pictures(root, src_root, all_pictures)
+                if pictures:
+                    stats["pictures borrowed"] += 1
         write_pictures(pictures, movies, dst, ir_files, stats, log)
 
 
@@ -325,7 +384,7 @@ def main():
         if os.path.isdir(os.path.join(base, d, "data", "items"))
     ]
     os.makedirs(args.output, exist_ok=True)
-    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures")}
+    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures", "pictures borrowed")}
     with open(os.path.join(args.output, "conversion log.txt"), "w") as log:
         for s in sources:
             print("Source:", s)
