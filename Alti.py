@@ -13,6 +13,8 @@ Format, all big-endian, written MSB-first as one bit stream:
       s[0], s[1], s[2], 0xF167A670, N
   version 0x13 (block size 19) - 24 byte header:
       s[0], s[1], s[2], 0xF167A67A, N, extra
+  version 0x14 (Altiverb 7, block size 20) - 24 byte header:
+      s[0], s[1], s[2], 0xF167A67F, N, 0x80000000
 
   s[0..2] are the first three samples, N the sample count. Every following sample is coded as
   the residual r[n] = (3*s[n-1] - 3*s[n-2] + s[n-3]) - s[n], in blocks of <block size> residuals
@@ -25,8 +27,12 @@ pick, and the stream must end exactly where the file does with only zero padding
 that passes is bit-for-bit what the encoder would write for the decoded samples, so the WAV is an
 exact copy of the original IR.
 
+Altiverb 7 libraries come as one .irbulk file holding the same coded streams (version 0x14,
+marker 0xF167A67F, block size 20, levels stored as recorded) plus pictures and a file table; pass
+the .irbulk as a source to convert it (see convert_irbulk).
+
 Usage:
-    python3 Alti.py [source_folder ...] [-o output_folder]
+    python3 Alti.py [source_folder_or_irbulk ...] [-o output_folder]
 
 Without arguments it converts the three "IR Installer */data/items" folders next to this script
 into "Altiverb 6 Library (decoded)" next to them. The folder tree is mirrored (with the leading
@@ -58,7 +64,7 @@ import numpy as np
 import soundfile as sf
 from PIL import Image
 
-MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6)}
+MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6), 0xF167A67F: (0x14, 6)}
 CHANNEL_SUFFIX = re.compile(r"\.(\d|L|R|C|Ls|Rs|LFE|l|r|c|ls|rs)$")
 COPY_EXT = {".kmz", ".iri"}
 PICTURE_EXT = {".jpg", ".jpeg", ".png", ".gif"}
@@ -366,6 +372,108 @@ def convert_tree(src_root, out_root, args, stats, log):
         write_pictures(pictures, movies, dst, ir_files, stats, log)
 
 
+def irbulk_table(data, pos):
+    """File table of an .irbulk: count, then (name, offset, size) entries."""
+    count = struct.unpack_from("<Q", data, pos)[0]
+    pos += 8
+    entries = []
+    for _ in range(count):
+        n = struct.unpack_from("<I", data, pos)[0]
+        name = data[pos + 4:pos + 4 + n].decode("utf-8")
+        offset, size = struct.unpack_from("<QQ", data, pos + 4 + n)
+        entries.append((name, offset, size))
+        pos += 4 + n + 16
+    return entries
+
+
+def convert_irbulk(path, out_root, args, stats, log):
+    """Altiverb 7 .irbulk: a database, then pictures and IR channels, then two file tables.
+    Header at 0x30 (little-endian u64): 3, 96, ?, picture table offset, IR table offset.
+    Picture record: u64 length + JPEG. IR record: u32 1, u32 sample count, u32 3, u32 stream
+    length, u32 0, then the same coded stream as Altiverb 6 (version 0x14: block size 20, an
+    extra header word 0x80000000 = full scale). Channel levels are stored as recorded, not
+    normalised, so no gains are needed."""
+    data = open(path, "rb").read()
+    if data[:8] != b"_IRBLK3_":
+        raise FormatError("not an _IRBLK3_ file")
+    pic_table, ir_table = struct.unpack_from("<QQ", data, 0x48)
+    pictures = irbulk_table(data, pic_table)
+    irs = irbulk_table(data, ir_table)
+
+    # Sample rate: stored as doubles in the database; use it when the bulk has a single one.
+    rates = {r for r in (44100.0, 48000.0, 88200.0, 96000.0)
+             if struct.pack("<d", r) in data[:min(o for _, o, _ in pictures + irs)]}
+    if len(rates) == 1:
+        rate = int(rates.pop())
+    else:
+        rate = 48000
+        stats["rate guessed"] += 1
+        log.write("no single sample rate found in %s, used 48000\n" % path)
+
+    # Pictures keep their names in their own folder's "00 DEFAULT PICTURES".
+    picture_files = {}  # folder -> extracted picture paths
+    for name, offset, _ in pictures:
+        length = struct.unpack_from("<Q", data, offset)[0]
+        folder, base = os.path.split(name)
+        out = os.path.join(out_root, folder, PICTURES_DIR)
+        os.makedirs(out, exist_ok=True)
+        dst = os.path.join(out, base)
+        with open(dst, "wb") as fh:
+            fh.write(data[offset + 8:offset + 8 + length])
+        picture_files.setdefault(folder, []).append(dst)
+    for folder, files in picture_files.items():
+        pngs = []
+        for f in files:
+            try:
+                with Image.open(f) as im:
+                    im.save(os.path.splitext(f)[0] + ".png")
+                pngs.append(f)
+                stats["pictures"] += 1
+            except OSError as e:
+                log.write("picture not readable: %s (%s)\n" % (f, e))
+        picture_files[folder] = pngs
+
+    folders = {}
+    for name, offset, _ in irs:
+        folders.setdefault(os.path.dirname(name), []).append((os.path.basename(name), offset))
+    for folder, channels in sorted(folders.items()):
+        decoded = []
+        for base, offset in channels:
+            one, count, three, length, _ = struct.unpack_from("<5I", data, offset)
+            try:
+                if (one, three) != (1, 3):
+                    raise FormatError("unknown record %d/%d" % (one, three))
+                samples = decode(data[offset + 20:offset + 20 + length])
+                if len(samples) != count:
+                    raise FormatError("record says %d samples, stream has %d" % (count, len(samples)))
+            except FormatError as e:
+                stats["failed"] += 1
+                log.write("FAILED %s/%s: %s\n" % (folder, base, e))
+                print("FAILED %s/%s: %s" % (folder, base, e))
+                continue
+            decoded.append((base, samples.astype(np.float64) / 2.0 ** 31))
+            stats["decoded"] += 1
+        if not decoded:
+            continue
+        dst = os.path.join(out_root, folder)
+        os.makedirs(dst, exist_ok=True)
+        peak = max(float(np.abs(x).max()) for _, x in decoded) or 1.0
+        scale = 10.0 ** (args.peak / 20.0) / peak
+        for base, x in decoded:
+            out = os.path.join(dst, os.path.splitext(base)[0] + ".wav")
+            if args.pcm24:
+                sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
+            else:
+                sf.write(out, (x * scale).astype(np.float32), rate, subtype="FLOAT")
+        # Pictures from the nearest folder above that has some, named so Convology finds them.
+        up = folder
+        while up and up not in picture_files:
+            up = os.path.dirname(up)
+        if picture_files.get(up):
+            write_pictures(picture_files[up], [], dst, [os.path.splitext(b)[0] for b, _ in decoded], stats, log)
+            stats["pictures borrowed"] += 1
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     base = os.path.dirname(here)
@@ -388,7 +496,10 @@ def main():
     with open(os.path.join(args.output, "conversion log.txt"), "w") as log:
         for s in sources:
             print("Source:", s)
-            convert_tree(s, args.output, args, stats, log)
+            if s.lower().endswith(".irbulk"):
+                convert_irbulk(s, args.output, args, stats, log)
+            else:
+                convert_tree(s, args.output, args, stats, log)
         log.write("\n%s\n" % stats)
     print(stats)
     print("Output:", args.output)
