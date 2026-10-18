@@ -538,7 +538,10 @@ def _convert_irbulk(data, path, out_root, args, stats, log):
         peak = max(float(np.abs(x).max()) for _, x, _ in decoded) or 1.0
         scale = 10.0 ** (args.peak / 20.0) / peak
         for base, x, rate in decoded:
-            out = safe_join(dst, os.path.splitext(base)[0] + ".wav")
+            # Keep a name that already ends in .wav, otherwise add the extension. splitext()
+            # would strip a channel suffix (".1", ".L") from an Altiverb 7 name that has no
+            # .wav and make several channels of a folder collide onto one output file.
+            out = safe_join(dst, base if base.lower().endswith(".wav") else base + ".wav")
             if args.pcm24:
                 sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
             else:
