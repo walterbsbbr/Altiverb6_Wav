@@ -54,6 +54,7 @@ PCM with --pcm24; --raw writes the stored samples without the gains.
 """
 
 import argparse
+import mmap
 import os
 import re
 import shutil
@@ -211,6 +212,18 @@ def read_info(folder):
 
 def clean(part):
     return part[1:] if part.startswith("%") else part
+
+
+def safe_join(root, *parts):
+    """Join under root, refusing anything that would land outside it.
+
+    .irbulk file tables carry their own names, so without this a crafted bulk could have
+    pictures and WAVs written, and folders created, anywhere the user can write."""
+    root = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(root, *parts))
+    if path != root and not path.startswith(root + os.sep):
+        raise FormatError("name escapes the output folder: %r" % (os.path.join(*parts),))
+    return path
 
 
 def convert_folder(root, files, dst, args, stats, log):
@@ -379,13 +392,23 @@ def convert_tree(src_root, out_root, args, stats, log):
 
 
 def irbulk_table(data, pos):
-    """File table of an .irbulk: count, then (name, offset, size) entries."""
+    """File table of an .irbulk: count, then (name, offset, size) entries.
+
+    Bounds-checked: a truncated or crafted bulk must give a FormatError here rather than a
+    struct.error, since the names and offsets drive which files get written and where."""
+    limit = len(data)
+    if pos < 0 or pos + 8 > limit:
+        raise FormatError("file table outside the file")
     count = struct.unpack_from("<Q", data, pos)[0]
     pos += 8
     entries = []
     for _ in range(count):
+        if pos + 20 > limit:
+            raise FormatError("file table runs past the end of the file")
         n = struct.unpack_from("<I", data, pos)[0]
-        name = data[pos + 4:pos + 4 + n].decode("utf-8")
+        if n > limit - pos - 20:
+            raise FormatError("file table name runs past the end of the file")
+        name = data[pos + 4:pos + 4 + n].decode("utf-8", "replace")
         offset, size = struct.unpack_from("<QQ", data, pos + 4 + n)
         entries.append((name, offset, size))
         pos += 4 + n + 16
@@ -425,8 +448,16 @@ def convert_irbulk(path, out_root, args, stats, log):
     Picture record: u64 length + JPEG. IR record: u32 1, u32 sample count, u32 3, u32 stream
     length, u32 0, then the same coded stream as Altiverb 6 (version 0x14: block size 20, an
     extra header word 0x80000000 = full scale). Channel levels are stored as recorded, not
-    normalised, so no gains are needed."""
-    data = open(path, "rb").read()
+    normalised, so no gains are needed.
+
+    The file is mapped rather than read: a bulk can be several GB and every access is a slice."""
+    if os.path.getsize(path) < 0x58:
+        raise FormatError("file too short")
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        _convert_irbulk(data, path, out_root, args, stats, log)
+
+
+def _convert_irbulk(data, path, out_root, args, stats, log):
     if data[:8] not in BULK_MAGIC:
         raise FormatError("not an _IRBLK3_ or _IRBULK_ file")
     pic_table, ir_table = struct.unpack_from("<QQ", data, 0x48)
@@ -459,9 +490,9 @@ def convert_irbulk(path, out_root, args, stats, log):
     for name, offset, _ in pictures:
         length = struct.unpack_from("<Q", data, offset)[0]
         folder, base = os.path.split(name)
-        out = os.path.join(out_root, folder, PICTURES_DIR)
+        out = safe_join(out_root, folder, PICTURES_DIR)
         os.makedirs(out, exist_ok=True)
-        dst = os.path.join(out, base)
+        dst = safe_join(out, base)
         with open(dst, "wb") as fh:
             fh.write(data[offset + 8:offset + 8 + length])
         picture_files.setdefault(folder, []).append(dst)
@@ -502,12 +533,12 @@ def convert_irbulk(path, out_root, args, stats, log):
             stats["decoded"] += 1
         if not decoded:
             continue
-        dst = os.path.join(out_root, folder)
+        dst = safe_join(out_root, folder)
         os.makedirs(dst, exist_ok=True)
         peak = max(float(np.abs(x).max()) for _, x, _ in decoded) or 1.0
         scale = 10.0 ** (args.peak / 20.0) / peak
         for base, x, rate in decoded:
-            out = os.path.join(dst, os.path.splitext(base)[0] + ".wav")
+            out = safe_join(dst, os.path.splitext(base)[0] + ".wav")
             if args.pcm24:
                 sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
             else:
