@@ -64,6 +64,10 @@ import numpy as np
 import soundfile as sf
 from PIL import Image
 
+# Altiverb 7 .irbulk container signatures: "_IRBLK3_" (v3) and the older "_IRBULK_" (v2).
+# Both hold the same file tables and coded streams, only the magic and the header
+# version word at 0x30 differ, so both go through convert_irbulk.
+BULK_MAGIC = (b"_IRBLK3_", b"_IRBULK_")
 MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6), 0xF167A67F: (0x14, 6)}
 CHANNEL_SUFFIX = re.compile(r"\.(\d|L|R|C|Ls|Rs|LFE|l|r|c|ls|rs)$")
 COPY_EXT = {".kmz", ".iri"}
@@ -394,8 +398,8 @@ def convert_irbulk(path, out_root, args, stats, log):
     extra header word 0x80000000 = full scale). Channel levels are stored as recorded, not
     normalised, so no gains are needed."""
     data = open(path, "rb").read()
-    if data[:8] != b"_IRBLK3_":
-        raise FormatError("not an _IRBLK3_ file")
+    if data[:8] not in BULK_MAGIC:
+        raise FormatError("not an _IRBLK3_ or _IRBULK_ file")
     pic_table, ir_table = struct.unpack_from("<QQ", data, 0x48)
     pictures = irbulk_table(data, pic_table)
     irs = irbulk_table(data, ir_table)
