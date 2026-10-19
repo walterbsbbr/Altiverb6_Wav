@@ -15,8 +15,9 @@ mirrored folder tree. See the docstring at the top of `Alti.py` for the format d
     python3 Alti.py <file.irbulk> -o "<output>"    # an Altiverb 7 IR bulk file
 
 Options: `--pcm24` (24-bit PCM output), `--raw` (no info.iri gains), `--join` (one multichannel
-file per IR instead of one mono file per channel), `--peak <dBFS>` (level of the loudest channel
-per IR folder, default -0.1).
+file per IR instead of one mono file per channel), `--skip-surround` (drop the surround sets, more
+than four channels per IR), `--no-pictures` (write only the WAVs, not the pictures), `--peak <dBFS>`
+(level of the loudest channel per IR folder, default -0.1).
 
 By default each IR channel becomes its own mono `<name>.wav`. With `--join` each IR becomes one
 file: a stereo pair becomes a stereo file, a true stereo set becomes one four channel file in

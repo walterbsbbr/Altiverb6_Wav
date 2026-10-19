@@ -54,7 +54,10 @@ PCM with --pcm24; --raw writes the stored samples without the gains. --join writ
 multichannel file per IR instead of one mono file per channel: a stereo pair becomes one stereo
 file, and a true stereo set becomes one four channel file in LL, LR, RL, RR order, the layout a
 convolution plug-in expects. IRs whose channel order is not known from their names (the 8 and 16
-channel surround sets, for instance) are left as separate mono files and reported in the log.
+channel surround sets, for instance) are left as separate mono files and reported in the log;
+--skip-surround drops those sets altogether and --no-pictures writes only the WAVs. The pictures
+are copied and re-encoded as both .jpg and .png for Convology and are most of the work of a
+conversion, so --no-pictures is worth having unless something displays them.
 """
 
 import argparse
@@ -86,6 +89,8 @@ JOIN_RIGHT = frozenset(("2", "4", "R", "r", "Rs", "rs"))
 # Position of each channel token in the standard order (L, R, Ls, Rs) of a surround set.
 JOIN_RANK = {"1": 0, "L": 0, "l": 0, "2": 1, "R": 1, "r": 1,
              "3": 2, "Ls": 2, "ls": 2, "4": 3, "Rs": 3, "rs": 3}
+# Most channels a joined file can hold: mono, stereo or quad surround / true stereo.
+JOIN_CHANNELS = 4
 COPY_EXT = {".kmz", ".iri"}
 PICTURE_EXT = {".jpg", ".jpeg", ".png", ".gif"}
 PICTURES_DIR = "00 DEFAULT PICTURES"
@@ -374,7 +379,8 @@ def borrowed_pictures(root, src_root, all_pictures):
 
 
 def convert_tree(src_root, out_root, args, stats, log):
-    all_pictures = {root: own_pictures(root, files) for root, dirs, files in os.walk(src_root)}
+    all_pictures = {} if args.no_pictures else \
+        {root: own_pictures(root, files) for root, dirs, files in os.walk(src_root)}
     for root, dirs, files in os.walk(src_root):
         dirs.sort()
         rel = os.path.relpath(root, src_root)
@@ -603,50 +609,60 @@ def _convert_irbulk(data, path, out_root, args, stats, log):
 
     # Pictures keep their names in their own folder's "00 DEFAULT PICTURES".
     picture_files = {}  # folder -> extracted picture paths
-    for name, offset, _ in pictures:
-        length = struct.unpack_from("<Q", data, offset)[0]
-        folder, base = os.path.split(name)
-        out = safe_join(out_root, folder, PICTURES_DIR)
-        os.makedirs(out, exist_ok=True)
-        dst = safe_join(out, base)
-        with open(dst, "wb") as fh:
-            fh.write(data[offset + 8:offset + 8 + length])
-        picture_files.setdefault(folder, []).append(dst)
-    for folder, files in picture_files.items():
-        pngs = []
-        for f in files:
-            try:
-                with Image.open(f) as im:
-                    im.save(os.path.splitext(f)[0] + ".png")
-                pngs.append(f)
-                stats["pictures"] += 1
-            except OSError as e:
-                log.write("picture not readable: %s (%s)\n" % (f, e))
-        picture_files[folder] = pngs
+    if not args.no_pictures:
+        for name, offset, _ in pictures:
+            length = struct.unpack_from("<Q", data, offset)[0]
+            folder, base = os.path.split(name)
+            out = safe_join(out_root, folder, PICTURES_DIR)
+            os.makedirs(out, exist_ok=True)
+            dst = safe_join(out, base)
+            with open(dst, "wb") as fh:
+                fh.write(data[offset + 8:offset + 8 + length])
+            picture_files.setdefault(folder, []).append(dst)
+        for folder, files in picture_files.items():
+            pngs = []
+            for f in files:
+                try:
+                    with Image.open(f) as im:
+                        im.save(os.path.splitext(f)[0] + ".png")
+                    pngs.append(f)
+                    stats["pictures"] += 1
+                except OSError as e:
+                    log.write("picture not readable: %s (%s)\n" % (f, e))
+            picture_files[folder] = pngs
 
     folders = {}
     for name, offset, _ in irs:
         folders.setdefault(os.path.dirname(name), []).append((name, os.path.basename(name), offset))
     rates_used = {}
+    dropped = 0
     for folder, channels in sorted(folders.items()):
-        decoded = []
+        # Group by stem before decoding, so the surround sets can be dropped untouched.
+        groups = {}
         for name, base, offset in channels:
-            one, count, three, length, _ = struct.unpack_from("<5I", data, offset)
-            try:
-                if (one, three) != (1, 3):
-                    raise FormatError("unknown record %d/%d" % (one, three))
-                samples = decode(data[offset + 20:offset + 20 + length])
-                if len(samples) != count:
-                    raise FormatError("record says %d samples, stream has %d" % (count, len(samples)))
-            except FormatError as e:
-                stats["failed"] += 1
-                log.write("FAILED %s/%s: %s\n" % (folder, base, e))
-                print("FAILED %s/%s: %s" % (folder, base, e))
-                continue
-            rate = rate_for(name)
-            rates_used[rate] = rates_used.get(rate, 0) + 1
-            decoded.append((base, samples.astype(np.float64) / 2.0 ** 31, rate))
-            stats["decoded"] += 1
+            groups.setdefault(ir_stem(base)[0], []).append((name, base, offset))
+        if args.skip_surround:
+            for stem in [s for s, items in groups.items() if len(items) > JOIN_CHANNELS]:
+                dropped += len(groups.pop(stem))
+        decoded = []
+        for stem, items in sorted(groups.items()):
+            for name, base, offset in items:
+                one, count, three, length, _ = struct.unpack_from("<5I", data, offset)
+                try:
+                    if (one, three) != (1, 3):
+                        raise FormatError("unknown record %d/%d" % (one, three))
+                    samples = decode(data[offset + 20:offset + 20 + length])
+                    if len(samples) != count:
+                        raise FormatError("record says %d samples, stream has %d" % (count, len(samples)))
+                except FormatError as e:
+                    stats["failed"] += 1
+                    log.write("FAILED %s/%s: %s\n" % (folder, base, e))
+                    print("FAILED %s/%s: %s" % (folder, base, e))
+                    continue
+                rate = rate_for(name)
+                rates_used[rate] = rates_used.get(rate, 0) + 1
+                decoded.append((base, samples.astype(np.float64) / 2.0 ** 31, rate))
+                stats["decoded"] += 1
         if not decoded:
             continue
         dst = safe_join(out_root, folder)
@@ -670,6 +686,10 @@ def _convert_irbulk(data, path, out_root, args, stats, log):
     if rates_used:
         log.write("%s: sample rates %s\n" % (os.path.basename(path),
                   ", ".join("%d x%d" % (r, n) for r, n in sorted(rates_used.items()))))
+    if dropped:
+        stats["surround skipped"] += dropped
+        log.write("%s: skipped %d channels in surround sets of more than %d channels\n"
+                  % (os.path.basename(path), dropped, JOIN_CHANNELS))
     if missed:
         stats["rate guessed"] += missed
         log.write("%d of %d IRs in %s had no rate in the database, used %d\n"
@@ -691,6 +711,14 @@ def main():
     ap.add_argument("--join", action="store_true",
                     help="write one multichannel file per IR (stereo, or four channel true "
                          "stereo) instead of one mono file per channel")
+    ap.add_argument("--skip-surround", action="store_true",
+                    help="skip surround sets (more than %d channels per IR), which have no "
+                         "stereo or true stereo use" % JOIN_CHANNELS)
+    # The pictures are copied and re-encoded as both .jpg and .png for Convology, which is
+    # most of the work of a conversion; convolution plug-ins that do not show them do not
+    # need them at all.
+    ap.add_argument("--no-pictures", action="store_true",
+                    help="do not write the picture files, only the WAVs")
     ap.add_argument("--peak", type=float, default=-0.1,
                     help="peak level in dBFS of the loudest channel of each IR folder (default -0.1)")
     args = ap.parse_args()
@@ -700,7 +728,7 @@ def main():
         if os.path.isdir(os.path.join(base, d, "data", "items"))
     ]
     os.makedirs(args.output, exist_ok=True)
-    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures", "pictures borrowed", "joined", "join skipped")}
+    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures", "pictures borrowed", "joined", "join skipped", "surround skipped")}
     with open(os.path.join(args.output, "conversion log.txt"), "w") as log:
         for s in sources:
             print("Source:", s)
