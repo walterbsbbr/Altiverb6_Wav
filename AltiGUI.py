@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import Alti  # noqa: E402
 
 STAT_KEYS = ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures",
-             "pictures borrowed")
+             "pictures borrowed", "joined", "join skipped")
 
 
 class Cancelled(Exception):
@@ -134,6 +134,7 @@ class Window(QWidget):
         self.pcm24 = QRadioButton("24-bit PCM")
         self.float_out.setChecked(True)
         self.raw = QCheckBox("Não aplicar os ganhos de canal do info.iri (Altiverb 6)")
+        self.join = QCheckBox("Um ficheiro multi-canal por IR (estéreo, ou true stereo de 4 canais)")
         self.peak = QDoubleSpinBox()
         self.peak.setRange(-24.0, 0.0)
         self.peak.setSingleStep(0.1)
@@ -146,6 +147,7 @@ class Window(QWidget):
         form.addRow("Formato", self.row(self.float_out, self.pcm24))
         form.addRow("Pico por pasta de IR", self.peak)
         form.addRow("", self.raw)
+        form.addRow("", self.join)
 
         self.bar = QProgressBar()
         self.status = QLabel("Escolha a pasta de origem e a pasta de saída.")
@@ -209,7 +211,7 @@ class Window(QWidget):
         self.status.setText("Convertendo %d canais (%d arquivos .irbulk)…" % (total, len(bulks)))
 
         args = types.SimpleNamespace(raw=self.raw.isChecked(), pcm24=self.pcm24.isChecked(),
-                                     peak=self.peak.value())
+                                     peak=self.peak.value(), join=self.join.isChecked())
         self.worker = Worker(src, out, args)
         self.worker.progress.connect(self.bar.setValue)
         self.worker.message.connect(self.log.appendPlainText)

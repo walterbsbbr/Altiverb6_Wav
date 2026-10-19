@@ -50,7 +50,11 @@ applies those gains (checked on the library: it brings the late-tail levels of t
 folder together, the opposite sign drives them apart), then scales each folder as a whole so its
 loudest channel peaks at -0.1 dBFS. Balance between L/R/surround channels is kept that way.
 Sample rate (48 or 44.1 kHz) also comes from info.iri. Output is 32-bit float WAV, or 24-bit
-PCM with --pcm24; --raw writes the stored samples without the gains.
+PCM with --pcm24; --raw writes the stored samples without the gains. --join writes one
+multichannel file per IR instead of one mono file per channel: a stereo pair becomes one stereo
+file, and a true stereo set becomes one four channel file in LL, LR, RL, RR order, the layout a
+convolution plug-in expects. IRs whose channel order is not known from their names (the 8 and 16
+channel surround sets, for instance) are left as separate mono files and reported in the log.
 """
 
 import argparse
@@ -73,6 +77,15 @@ BULK_MAGIC = (b"_IRBLK3_", b"_IRBULK_")
 RATE_VALUES = (44100, 48000, 88200, 96000)
 MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6), 0xF167A67F: (0x14, 6)}
 CHANNEL_SUFFIX = re.compile(r"\.(\d|L|R|C|Ls|Rs|LFE|l|r|c|ls|rs)$")
+# Channel tokens at the end of an IR name, longest first so "Ls" is not read as "L".
+CHANNEL_TOKEN = re.compile(r"\.(\d+|Ls|Rs|LFE|ls|rs|L|R|C|l|r|c)$")
+# Verified on the libraries by finding the same audio bytes under a number in one folder and a
+# letter in another: 1 is L, 2 is R, 3 is Ls and 4 is Rs, the standard multichannel order.
+JOIN_LEFT = frozenset(("1", "3", "L", "l", "Ls", "ls"))
+JOIN_RIGHT = frozenset(("2", "4", "R", "r", "Rs", "rs"))
+# Position of each channel token in the standard order (L, R, Ls, Rs) of a surround set.
+JOIN_RANK = {"1": 0, "L": 0, "l": 0, "2": 1, "R": 1, "r": 1,
+             "3": 2, "Ls": 2, "ls": 2, "4": 3, "Rs": 3, "rs": 3}
 COPY_EXT = {".kmz", ".iri"}
 PICTURE_EXT = {".jpg", ".jpeg", ".png", ".gif"}
 PICTURES_DIR = "00 DEFAULT PICTURES"
@@ -442,6 +455,109 @@ def irbulk_rates(data, end):
     return rates
 
 
+def ir_stem(base):
+    """Split an IR channel name into its stem and its channel tokens.
+
+    "Name.1" and "Name.L.1" give ("Name", ("1",)) and ("Name", ("L", "1")), so the
+    channels of one IR can be recognised and named after the IR rather than one channel."""
+    name = os.path.splitext(base)[0] if base.lower().endswith(".wav") else base
+    tokens = []
+    while True:
+        m = CHANNEL_TOKEN.search(name)
+        if not m:
+            return name, tuple(tokens)
+        tokens.insert(0, m.group(1))
+        name = name[:m.start()]
+
+
+def join_order(entries):
+    """Order one IR's channels for a single multichannel file, or None if there is no
+    verified layout for them.
+
+    entries are (base, samples, rate). The channel is the token position where the names
+    differ, so a mic or matrix name in front of it ("...C.1", "...950.c.2") needs no
+    interpreting; every differing token must be a known channel token. Two channels give a
+    stereo pair, four give either a surround set in the standard L, R, Ls, Rs order or, when
+    the names carry two differing tokens, a true stereo set ordered LL, LR, RL, RR -- the
+    order a four channel true stereo file is expected in. Anything else, the 8 and 16 channel
+    surround sets in particular, has no verified layout and returns None so that those
+    channels stay separate mono files rather than being guessed at."""
+    if len(entries) < 2:
+        return entries
+    tokens = [ir_stem(base)[1] for base, _, _ in entries]
+    if len({len(t) for t in tokens}) != 1:
+        return None
+    depth = len(tokens[0])
+    diff = [p for p in range(depth) if len({t[p] for t in tokens}) > 1]
+    if not diff or any(t[p] not in JOIN_RANK for p in diff for t in tokens):
+        return None
+    if len(entries) == 2 and len(diff) == 1:
+        p = diff[0]
+        if {t[p] in JOIN_LEFT for t in tokens} == {True, False}:
+            return sorted(entries, key=lambda e: ir_stem(e[0])[1][p] in JOIN_RIGHT)
+    elif len(entries) == 4 and len(diff) == 1:
+        p = diff[0]
+        if sorted(JOIN_RANK[t[p]] for t in tokens) == [0, 1, 2, 3]:
+            return sorted(entries, key=lambda e: JOIN_RANK[ir_stem(e[0])[1][p]])
+    elif len(entries) == 4 and len(diff) == 2:
+        pin, pout = diff
+        for p in diff:
+            sides = {t[p] in JOIN_LEFT for t in tokens}
+            if sides != {True, False}:
+                return None
+        return sorted(entries, key=lambda e: (ir_stem(e[0])[1][pin] in JOIN_RIGHT,
+                                              ir_stem(e[0])[1][pout] in JOIN_RIGHT))
+    return None
+
+
+def write_channel(dst, base, x, rate, scale, args):
+    out = safe_join(dst, base if base.lower().endswith(".wav") else base + ".wav")
+    if args.pcm24:
+        sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
+    else:
+        sf.write(out, (x * scale).astype(np.float32), rate, subtype="FLOAT")
+
+
+def write_joined(dst, entries, scale, args, stats, log):
+    """One multichannel file per IR instead of one file per channel.
+
+    Channels are grouped by stem, so a folder holding several takes still gets one file per
+    take. Channels shorter than the longest are padded with silence. A group with no verified
+    channel order is written as mono files rather than guessed at, and reported in the log."""
+    groups = {}
+    for base, x, rate in entries:
+        groups.setdefault(ir_stem(base)[0], []).append((base, x, rate))
+    for stem, group in sorted(groups.items()):
+        order = join_order(group)
+        why = "no verified channel order"
+        if order is not None and len({r for _, _, r in order}) != 1:
+            why = "channels at different sample rates"
+            order = None
+        if order is None:
+            stats["join skipped"] += 1
+            log.write("%s for %s, left as %d mono files\n"
+                      % (why, os.path.join(dst, stem), len(group)))
+            for base, x, rate in group:
+                write_channel(dst, base, x, rate, scale, args)
+        elif len(order) == 1:
+            write_channel(dst, order[0][0], order[0][1], order[0][2], scale, args)
+        else:
+            rate = order[0][2]
+            # The channels of one IR are not all the same length; pad the short ones with
+            # silence so every channel of the file is the longest of the set.
+            n = max(len(x) for _, x, _ in order)
+            data = np.zeros((n, len(order)), dtype=np.float64)
+            for slot, (_, x, _) in enumerate(order):
+                data[:len(x), slot] = x
+            data *= scale
+            out = safe_join(dst, stem + ".wav")
+            if args.pcm24:
+                sf.write(out, np.round(data * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
+            else:
+                sf.write(out, data.astype(np.float32), rate, subtype="FLOAT")
+            stats["joined"] += 1
+
+
 def convert_irbulk(path, out_root, args, stats, log):
     """Altiverb 7 .irbulk: a database, then pictures and IR channels, then two file tables.
     Header at 0x30 (little-endian u64): 3, 96, ?, picture table offset, IR table offset.
@@ -537,15 +653,11 @@ def _convert_irbulk(data, path, out_root, args, stats, log):
         os.makedirs(dst, exist_ok=True)
         peak = max(float(np.abs(x).max()) for _, x, _ in decoded) or 1.0
         scale = 10.0 ** (args.peak / 20.0) / peak
-        for base, x, rate in decoded:
-            # Keep a name that already ends in .wav, otherwise add the extension. splitext()
-            # would strip a channel suffix (".1", ".L") from an Altiverb 7 name that has no
-            # .wav and make several channels of a folder collide onto one output file.
-            out = safe_join(dst, base if base.lower().endswith(".wav") else base + ".wav")
-            if args.pcm24:
-                sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
-            else:
-                sf.write(out, (x * scale).astype(np.float32), rate, subtype="FLOAT")
+        if args.join:
+            write_joined(dst, decoded, scale, args, stats, log)
+        else:
+            for base, x, rate in decoded:
+                write_channel(dst, base, x, rate, scale, args)
         # Pictures from the nearest folder above that has some, named so Convology finds them.
         up = folder
         while up and up not in picture_files:
@@ -573,6 +685,12 @@ def main():
     ap.add_argument("--raw", action="store_true",
                     help="do not apply the per-channel gains from info.iri")
     ap.add_argument("--pcm24", action="store_true", help="write 24-bit PCM instead of 32-bit float")
+    # One multichannel file per IR: stereo for a stereo pair, four channels in LL LR RL RR
+    # order for a true stereo set (what a convolution plug-in expects), instead of one mono
+    # file per channel. Applies to .irbulk sources; the Altiverb 6 tree is written per channel.
+    ap.add_argument("--join", action="store_true",
+                    help="write one multichannel file per IR (stereo, or four channel true "
+                         "stereo) instead of one mono file per channel")
     ap.add_argument("--peak", type=float, default=-0.1,
                     help="peak level in dBFS of the loudest channel of each IR folder (default -0.1)")
     args = ap.parse_args()
@@ -582,7 +700,7 @@ def main():
         if os.path.isdir(os.path.join(base, d, "data", "items"))
     ]
     os.makedirs(args.output, exist_ok=True)
-    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures", "pictures borrowed")}
+    stats = {k: 0 for k in ("decoded", "wav read", "failed", "rate guessed", "gain missing", "pictures", "pictures borrowed", "joined", "join skipped")}
     with open(os.path.join(args.output, "conversion log.txt"), "w") as log:
         for s in sources:
             print("Source:", s)
