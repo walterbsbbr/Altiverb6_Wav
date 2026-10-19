@@ -54,6 +54,7 @@ PCM with --pcm24; --raw writes the stored samples without the gains.
 """
 
 import argparse
+import mmap
 import os
 import re
 import shutil
@@ -64,6 +65,12 @@ import numpy as np
 import soundfile as sf
 from PIL import Image
 
+# Altiverb 7 .irbulk container signatures: "_IRBLK3_" (v3) and the older "_IRBULK_" (v2).
+# Both hold the same file tables and coded streams, only the magic and the header
+# version word at 0x30 differ, so both go through convert_irbulk.
+BULK_MAGIC = (b"_IRBLK3_", b"_IRBULK_")
+# Sample rates Altiverb stores, as little-endian doubles, in the .irbulk database.
+RATE_VALUES = (44100, 48000, 88200, 96000)
 MARKERS = {0xF167A670: (0x11, 5), 0xF167A675: (0x12, 9), 0xF167A67A: (0x13, 6), 0xF167A67F: (0x14, 6)}
 CHANNEL_SUFFIX = re.compile(r"\.(\d|L|R|C|Ls|Rs|LFE|l|r|c|ls|rs)$")
 COPY_EXT = {".kmz", ".iri"}
@@ -205,6 +212,18 @@ def read_info(folder):
 
 def clean(part):
     return part[1:] if part.startswith("%") else part
+
+
+def safe_join(root, *parts):
+    """Join under root, refusing anything that would land outside it.
+
+    .irbulk file tables carry their own names, so without this a crafted bulk could have
+    pictures and WAVs written, and folders created, anywhere the user can write."""
+    root = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(root, *parts))
+    if path != root and not path.startswith(root + os.sep):
+        raise FormatError("name escapes the output folder: %r" % (os.path.join(*parts),))
+    return path
 
 
 def convert_folder(root, files, dst, args, stats, log):
@@ -373,17 +392,54 @@ def convert_tree(src_root, out_root, args, stats, log):
 
 
 def irbulk_table(data, pos):
-    """File table of an .irbulk: count, then (name, offset, size) entries."""
+    """File table of an .irbulk: count, then (name, offset, size) entries.
+
+    Bounds-checked: a truncated or crafted bulk must give a FormatError here rather than a
+    struct.error, since the names and offsets drive which files get written and where."""
+    limit = len(data)
+    if pos < 0 or pos + 8 > limit:
+        raise FormatError("file table outside the file")
     count = struct.unpack_from("<Q", data, pos)[0]
     pos += 8
     entries = []
     for _ in range(count):
+        if pos + 20 > limit:
+            raise FormatError("file table runs past the end of the file")
         n = struct.unpack_from("<I", data, pos)[0]
-        name = data[pos + 4:pos + 4 + n].decode("utf-8")
+        if n > limit - pos - 20:
+            raise FormatError("file table name runs past the end of the file")
+        name = data[pos + 4:pos + 4 + n].decode("utf-8", "replace")
         offset, size = struct.unpack_from("<QQ", data, pos + 4 + n)
         entries.append((name, offset, size))
         pos += 4 + n + 16
     return entries
+
+
+def irbulk_rates(data, end):
+    """Per-IR sample rate from the .irbulk database (the bytes before the first file record).
+
+    Each database record stores the rate as a little-endian double followed by the words
+    1, len, len and then the IR's name exactly as it appears in the file table, so the rate
+    belongs to one IR rather than to the whole bulk. Checked on the library: every IR is
+    found this way and no name carries two different rates. Names this misses are simply
+    absent, and convert_irbulk falls back to the bulk-wide scan for those."""
+    rates = {}
+    for rate in RATE_VALUES:
+        pattern = struct.pack("<d", float(rate))
+        pos = data.find(pattern, 0, end)
+        while pos >= 0:
+            # the rate is only a rate if the record header follows it
+            if pos + 20 <= end and data[pos + 8:pos + 12] == b"\x01\x00\x00\x00":
+                n = struct.unpack_from("<I", data, pos + 12)[0]
+                if 0 < n <= 4096 and struct.unpack_from("<I", data, pos + 16)[0] == n:
+                    try:
+                        name = data[pos + 20:pos + 20 + n].decode("ascii")
+                    except UnicodeDecodeError:
+                        name = ""
+                    if "/" in name and all(32 <= ord(c) < 127 for c in name):
+                        rates.setdefault(name, rate)
+            pos = data.find(pattern, pos + 1, end)
+    return rates
 
 
 def convert_irbulk(path, out_root, args, stats, log):
@@ -392,32 +448,51 @@ def convert_irbulk(path, out_root, args, stats, log):
     Picture record: u64 length + JPEG. IR record: u32 1, u32 sample count, u32 3, u32 stream
     length, u32 0, then the same coded stream as Altiverb 6 (version 0x14: block size 20, an
     extra header word 0x80000000 = full scale). Channel levels are stored as recorded, not
-    normalised, so no gains are needed."""
-    data = open(path, "rb").read()
-    if data[:8] != b"_IRBLK3_":
-        raise FormatError("not an _IRBLK3_ file")
+    normalised, so no gains are needed.
+
+    The file is mapped rather than read: a bulk can be several GB and every access is a slice."""
+    if os.path.getsize(path) < 0x58:
+        raise FormatError("file too short")
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        _convert_irbulk(data, path, out_root, args, stats, log)
+
+
+def _convert_irbulk(data, path, out_root, args, stats, log):
+    if data[:8] not in BULK_MAGIC:
+        raise FormatError("not an _IRBLK3_ or _IRBULK_ file")
     pic_table, ir_table = struct.unpack_from("<QQ", data, 0x48)
     pictures = irbulk_table(data, pic_table)
     irs = irbulk_table(data, ir_table)
 
-    # Sample rate: stored as doubles in the database; use it when the bulk has a single one.
-    rates = {r for r in (44100.0, 48000.0, 88200.0, 96000.0)
-             if struct.pack("<d", r) in data[:min(o for _, o, _ in pictures + irs)]}
-    if len(rates) == 1:
-        rate = int(rates.pop())
-    else:
-        rate = 48000
-        stats["rate guessed"] += 1
-        log.write("no single sample rate found in %s, used 48000\n" % path)
+    # Sample rate: every IR's rate is stored as a double in the database, so attribute it per
+    # IR. Libraries that mix 44.1 and 48 kHz (Altiverb's DESIGN, GEAR, MUSIC and POST do) would
+    # otherwise have one rate forced on every IR and the 44.1 kHz part would play ~8.8% fast.
+    # Names the per-IR scan does not cover fall back to the bulk-wide scan, which only resolves
+    # a bulk that uses a single rate, and then to 48000.
+    end = min([o for _, o, _ in pictures + irs] + [len(data)])
+    name_rates = irbulk_rates(data, end)
+    bulk = {r for r in RATE_VALUES if struct.pack("<d", float(r)) in data[:end]}
+    default_rate = bulk.pop() if len(bulk) == 1 else 48000
+    missed = 0
+
+    def rate_for(name):
+        nonlocal missed
+        if name in name_rates:
+            return name_rates[name]
+        stripped = CHANNEL_SUFFIX.sub("", name)
+        if stripped in name_rates:
+            return name_rates[stripped]
+        missed += 1
+        return default_rate
 
     # Pictures keep their names in their own folder's "00 DEFAULT PICTURES".
     picture_files = {}  # folder -> extracted picture paths
     for name, offset, _ in pictures:
         length = struct.unpack_from("<Q", data, offset)[0]
         folder, base = os.path.split(name)
-        out = os.path.join(out_root, folder, PICTURES_DIR)
+        out = safe_join(out_root, folder, PICTURES_DIR)
         os.makedirs(out, exist_ok=True)
-        dst = os.path.join(out, base)
+        dst = safe_join(out, base)
         with open(dst, "wb") as fh:
             fh.write(data[offset + 8:offset + 8 + length])
         picture_files.setdefault(folder, []).append(dst)
@@ -435,10 +510,11 @@ def convert_irbulk(path, out_root, args, stats, log):
 
     folders = {}
     for name, offset, _ in irs:
-        folders.setdefault(os.path.dirname(name), []).append((os.path.basename(name), offset))
+        folders.setdefault(os.path.dirname(name), []).append((name, os.path.basename(name), offset))
+    rates_used = {}
     for folder, channels in sorted(folders.items()):
         decoded = []
-        for base, offset in channels:
+        for name, base, offset in channels:
             one, count, three, length, _ = struct.unpack_from("<5I", data, offset)
             try:
                 if (one, three) != (1, 3):
@@ -451,16 +527,21 @@ def convert_irbulk(path, out_root, args, stats, log):
                 log.write("FAILED %s/%s: %s\n" % (folder, base, e))
                 print("FAILED %s/%s: %s" % (folder, base, e))
                 continue
-            decoded.append((base, samples.astype(np.float64) / 2.0 ** 31))
+            rate = rate_for(name)
+            rates_used[rate] = rates_used.get(rate, 0) + 1
+            decoded.append((base, samples.astype(np.float64) / 2.0 ** 31, rate))
             stats["decoded"] += 1
         if not decoded:
             continue
-        dst = os.path.join(out_root, folder)
+        dst = safe_join(out_root, folder)
         os.makedirs(dst, exist_ok=True)
-        peak = max(float(np.abs(x).max()) for _, x in decoded) or 1.0
+        peak = max(float(np.abs(x).max()) for _, x, _ in decoded) or 1.0
         scale = 10.0 ** (args.peak / 20.0) / peak
-        for base, x in decoded:
-            out = os.path.join(dst, os.path.splitext(base)[0] + ".wav")
+        for base, x, rate in decoded:
+            # Keep a name that already ends in .wav, otherwise add the extension. splitext()
+            # would strip a channel suffix (".1", ".L") from an Altiverb 7 name that has no
+            # .wav and make several channels of a folder collide onto one output file.
+            out = safe_join(dst, base if base.lower().endswith(".wav") else base + ".wav")
             if args.pcm24:
                 sf.write(out, np.round(x * scale * 8388607).astype(np.int32) << 8, rate, subtype="PCM_24")
             else:
@@ -470,8 +551,17 @@ def convert_irbulk(path, out_root, args, stats, log):
         while up and up not in picture_files:
             up = os.path.dirname(up)
         if picture_files.get(up):
-            write_pictures(picture_files[up], [], dst, [os.path.splitext(b)[0] for b, _ in decoded], stats, log)
+            write_pictures(picture_files[up], [], dst, [os.path.splitext(b)[0] for b, _, _ in decoded], stats, log)
             stats["pictures borrowed"] += 1
+
+    # Say which rates were used: silently forcing one rate on a mixed library was the bug.
+    if rates_used:
+        log.write("%s: sample rates %s\n" % (os.path.basename(path),
+                  ", ".join("%d x%d" % (r, n) for r, n in sorted(rates_used.items()))))
+    if missed:
+        stats["rate guessed"] += missed
+        log.write("%d of %d IRs in %s had no rate in the database, used %d\n"
+                  % (missed, len(irs), os.path.basename(path), default_rate))
 
 
 def main():

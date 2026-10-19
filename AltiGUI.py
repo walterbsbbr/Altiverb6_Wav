@@ -72,7 +72,7 @@ def find_sources(folder):
         try:
             with open(b, "rb") as fh:
                 head = fh.read(0x58)
-                if head[:8] == b"_IRBLK3_":
+                if head[:8] in Alti.BULK_MAGIC:
                     fh.seek(struct.unpack_from("<Q", head, 0x50)[0])
                     channels += struct.unpack("<Q", fh.read(8))[0]
         except (OSError, struct.error):
